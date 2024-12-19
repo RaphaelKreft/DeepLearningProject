@@ -1,3 +1,13 @@
+"""
+This file contains training logic for the Masked Prediction Paradigm. Aims to allow training as in MAEEG or EEg2Rep.
+Usage:
+    - Create a config that specifies dataset, model and loss function
+    - dataset: make sure to use the correct training mode so dataloader and model behave correctly
+        - ex. pretrain-mp lets dataloader only load single eeg epochs not two-views augmented!
+    - loss: specify a correct loss function. Add a supported loss name as 'loss' to train config
+        - you can additionally also add loss-params a dict of named arguments you pass to your loss
+"""
+
 import json
 import argparse
 import warnings
@@ -5,8 +15,9 @@ import warnings
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+from models.main_model_mp import MainModelMaskedPrediction
 from utils import *
-from loss import SupConLoss
+from loss import *
 from loader import EEGDataLoader
 from models.main_model_crl import MainModel
 
@@ -19,7 +30,13 @@ class OneFoldTrainer:
         self.cfg = config
         self.tp_cfg = config['training_params']
         self.es_cfg = self.tp_cfg['early_stopping']
-        
+
+        # assert that the correct training mode is set: 'pretrain-mp'. THis makes sure the models and dataset show correct behavior
+        assert self.tp_cfg['mode'] and self.tp_cfg['mode'] == 'pretrain_mp'
+        # assert a loss is given in the current training config and the loss exists
+        assert self.tp_cfg.get('loss', False)
+        assert self.tp_cfg['loss'] in SUPPORTED_LOSS_FUNCTIONS
+
         self.device = get_device(preference="cuda")
         print('[INFO] Config name: {}'.format(config['name']))
         print('[INFO] Device: {}'.format(str(self.device)))
@@ -28,7 +45,8 @@ class OneFoldTrainer:
         self.model = self.build_model()
         self.loader_dict = self.build_dataloader()
 
-        self.criterion = SupConLoss(temperature=self.tp_cfg['temperature'])
+        # load selected loss with its parameters (if these parameters are given)
+        self.criterion = LOSS_MAP[self.tp_cfg['loss']](**(self.tp_cfg['loss_params'] if 'loss_params' in self.tp_cfg.keys() else {}))
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.tp_cfg['lr'], weight_decay=self.tp_cfg['weight_decay'])
         
         self.ckpt_path = os.path.join('checkpoints', config['name'])
@@ -36,7 +54,7 @@ class OneFoldTrainer:
         self.early_stopping = EarlyStopping(patience=self.es_cfg['patience'], verbose=True, ckpt_path=self.ckpt_path, ckpt_name=self.ckpt_name, mode=self.es_cfg['mode'])
 
     def build_model(self):
-        model = MainModel(self.cfg)
+        model = MainModelMaskedPrediction(self.cfg)
         print('[INFO] Number of params of model: ', sum(p.numel() for p in model.parameters() if p.requires_grad))
         model = torch.nn.DataParallel(model, device_ids=list(range(len(self.args.gpu.split(",")))))
         model.to(self.device)
@@ -45,7 +63,10 @@ class OneFoldTrainer:
         return model
     
     def build_dataloader(self):
-        dataloader_args = {'batch_size': self.tp_cfg['batch_size'], 'shuffle': True, 'num_workers': 4*len(self.args.gpu.split(",")), 'pin_memory': True}
+        dataloader_args = {'batch_size': self.tp_cfg['batch_size'], # default data loader args, using 4 workers per GPU, TODO: what about prefetching
+                           'shuffle': True,
+                           'num_workers': 4*len(self.args.gpu.split(",")), # self.args.gpu.split defaults to 1 even when arg not given
+                           'pin_memory': True}
         train_dataset = EEGDataLoader(self.cfg, self.fold, set='train')
         train_loader = DataLoader(dataset=train_dataset, **dataloader_args)
         val_dataset = EEGDataLoader(self.cfg, self.fold, set='val')
@@ -55,6 +76,12 @@ class OneFoldTrainer:
         return {'train': train_loader, 'val': val_loader}
 
     def train_one_epoch(self):
+        """
+        We modify this method from train_crl.py to be able to deal with only raw single eeg epochs and not the two-view
+        augmented approach.
+
+        TODO: check data-loading in action!
+        """
         self.model.train()
         train_loss = 0
 
@@ -62,12 +89,9 @@ class OneFoldTrainer:
             loss = 0
             labels = labels.view(-1).to(self.device)
 
-            inputs = torch.cat([inputs[0], inputs[1]], dim=0).to(self.device)
-            outputs = self.model(inputs)[0]
+            outputs = self.model(inputs)[0]  # outputs here are expected to be reconstruction prediction
 
-            f1, f2 = torch.split(outputs, [labels.size(0), labels.size(0)], dim=0)
-            features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-            loss += self.criterion(features, labels)
+            loss += self.criterion(inputs, outputs, labels)
             
             self.optimizer.zero_grad()
             loss.backward()
@@ -99,7 +123,7 @@ class OneFoldTrainer:
             outputs = self.model(inputs)[0]
 
             features = outputs.unsqueeze(1).repeat(1, 2, 1)
-            loss += self.criterion(features, labels)
+            loss += self.criterion(inputs, features, labels)
 
             eval_loss += loss.item()
             
