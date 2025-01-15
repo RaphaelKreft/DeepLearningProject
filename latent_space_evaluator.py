@@ -18,7 +18,7 @@ def main():
     ckpt_path = os.path.join('checkpoints', config['name'])
     embeddings_path = os.path.join(ckpt_path, 'embeddings.pt')
     
-    data = torch.load(embeddings_path)
+    data = torch.load(embeddings_path, map_location="cpu")
     embeddings = data["embeddings"].detach().cpu().numpy()
     labels = data["labels"].detach().cpu().numpy()
     
