@@ -17,6 +17,7 @@ from scipy.stats import entropy
 class BaseMetric(ABC):
     """
     Abstract base class for metrics.
+    Embeddings can be of any dimension.
     """
 
     @abstractmethod
@@ -32,7 +33,7 @@ class BaseMetric(ABC):
         Computes the metric.
 
         Parameters:
-            embeddings_2d (np.ndarray): 2D embeddings (shape: [n_samples, 2]).
+            embeddings_2d (np.ndarray): Embeddings of shape [n_samples, n_features].
             labels (np.ndarray): True class labels (shape: [n_samples]).
             n_clusters (int): Number of expected clusters.
             original_embeddings (np.ndarray, optional): High-dimensional embeddings,
